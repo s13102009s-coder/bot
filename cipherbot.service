@@ -1,0 +1,15 @@
+[Unit]
+Description=Secret Cipher Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/secret-cipher-bot
+EnvironmentFile=/home/secret-cipher-bot/.env
+ExecStart=/home/secret-cipher-bot/venv/bin/python bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
