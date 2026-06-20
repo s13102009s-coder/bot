@@ -173,10 +173,16 @@ async def inline_handler(inline_query: InlineQuery):
     await inline_query.answer(results=results, cache_time=1, is_personal=True)
 
 
+def message_text_from_callback(callback: CallbackQuery) -> Optional[str]:
+    if callback.message and callback.message.text:
+        return callback.message.text.removeprefix("🔓 ").strip()
+    return None
+
+
 @dp.callback_query(F.data.startswith("enc:"))
 async def encrypt_callback(callback: CallbackQuery):
     key = callback.data.split(":", 1)[1]
-    text = callback.message.text or get_text(key)
+    text = message_text_from_callback(callback) or get_text(key)
     if not text:
         await callback.answer("Текст не найден. Отправьте сообщение заново.", show_alert=True)
         return
@@ -191,12 +197,25 @@ async def encrypt_callback(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("dec:"))
 async def decrypt_callback(callback: CallbackQuery):
-    text = callback.message.text
-    if not text:
+    key = callback.data.split(":", 1)[1]
+    current_text = message_text_from_callback(callback)
+
+    if current_text:
+        decrypted = decode(current_text)
+    else:
+        stored = get_text(key)
+        if not stored:
+            await callback.answer(
+                "Текст не найден. Отправьте сообщение заново.",
+                show_alert=True,
+            )
+            return
+        decrypted = stored.upper()
+
+    if not decrypted:
         await callback.answer("Нечего расшифровывать.", show_alert=True)
         return
 
-    decrypted = decode(text)
     if not await edit_secret_message(callback, f"🔓 {decrypted}"):
         await callback.answer("Не удалось расшифровать сообщение.", show_alert=True)
         return
@@ -209,7 +228,7 @@ async def selfdestruct_callback(callback: CallbackQuery):
     parts = callback.data.split(":")
     key = parts[1]
     delay = int(parts[2])
-    text = callback.message.text or get_text(key)
+    text = message_text_from_callback(callback) or get_text(key)
     if not text:
         await callback.answer("Текст не найден.", show_alert=True)
         return

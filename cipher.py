@@ -26,6 +26,7 @@ def encode(text: str) -> str:
 
 def decode(text: str) -> str:
     """Расшифровывает эмодзи обратно в текст."""
+    text = text.removeprefix("🔓 ").strip()
     result = []
     for ch in text:
         if ch in EMOJI_TO_LETTER:
