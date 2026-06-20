@@ -1,47 +1,131 @@
+import sqlite3
 import time
 import uuid
-from typing import Optional
+from typing import Any, Dict, Optional
 
-from config import TTL_SECONDS
+from config import DB_PATH, TTL_SECONDS
+from pin_utils import hash_pin, verify_pin
 
-_pending = {}
-
-
-def _cleanup():
-    now = time.time()
-    expired = [key for key, data in _pending.items() if now - data["ts"] > TTL_SECONDS]
-    for key in expired:
-        del _pending[key]
+_pending_attempts: Dict[str, int] = {}
 
 
-def store_text(text: str) -> str:
-    _cleanup()
+def _connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    with _connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS secrets (
+                key TEXT PRIMARY KEY,
+                text TEXT NOT NULL,
+                pin_salt TEXT NOT NULL,
+                pin_hash TEXT NOT NULL,
+                sd_delay INTEGER,
+                inline_message_id TEXT,
+                chat_id INTEGER,
+                message_id INTEGER,
+                created_at REAL NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def _cleanup(conn: sqlite3.Connection) -> None:
+    cutoff = time.time() - TTL_SECONDS
+    conn.execute("DELETE FROM secrets WHERE created_at < ?", (cutoff,))
+
+
+def store_secret(text: str, pin: str) -> str:
+    init_db()
     key = uuid.uuid4().hex[:12]
-    _pending[key] = {"text": text, "ts": time.time(), "sd_delay": None}
+    salt_hex, hash_hex = hash_pin(pin)
+    with _connect() as conn:
+        _cleanup(conn)
+        conn.execute(
+            """
+            INSERT INTO secrets (key, text, pin_salt, pin_hash, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (key, text, salt_hex, hash_hex, time.time()),
+        )
+        conn.commit()
     return key
 
 
-def get_text(key: str) -> Optional[str]:
-    _cleanup()
-    data = _pending.get(key)
-    return data["text"] if data else None
-
-
-def arm_self_destruct(key: str, delay: int) -> bool:
-    _cleanup()
-    data = _pending.get(key)
-    if not data:
-        return False
-    data["sd_delay"] = delay
-    data["ts"] = time.time()
-    return True
-
-
-def pop_self_destruct_delay(key: str) -> Optional[int]:
-    _cleanup()
-    data = _pending.get(key)
-    if not data:
+def get_secret(key: str) -> Optional[Dict[str, Any]]:
+    init_db()
+    with _connect() as conn:
+        _cleanup(conn)
+        row = conn.execute("SELECT * FROM secrets WHERE key = ?", (key,)).fetchone()
+    if not row:
         return None
-    delay = data.get("sd_delay")
-    data["sd_delay"] = None
-    return delay
+    return dict(row)
+
+
+def check_pin(key: str, pin: str) -> Optional[str]:
+    secret = get_secret(key)
+    if not secret:
+        return None
+    if verify_pin(pin, secret["pin_salt"], secret["pin_hash"]):
+        _pending_attempts.pop(key, None)
+        return secret["text"]
+    attempts = _pending_attempts.get(key, 0) + 1
+    _pending_attempts[key] = attempts
+    return None
+
+
+def pin_attempts(key: str) -> int:
+    return _pending_attempts.get(key, 0)
+
+
+def arm_self_destruct(
+    key: str,
+    delay: int,
+    *,
+    inline_message_id: Optional[str] = None,
+    chat_id: Optional[int] = None,
+    message_id: Optional[int] = None,
+) -> bool:
+    init_db()
+    with _connect() as conn:
+        _cleanup(conn)
+        cur = conn.execute(
+            """
+            UPDATE secrets
+            SET sd_delay = ?, inline_message_id = ?, chat_id = ?, message_id = ?, created_at = ?
+            WHERE key = ?
+            """,
+            (delay, inline_message_id, chat_id, message_id, time.time(), key),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def pop_self_destruct_target(key: str) -> Optional[Dict[str, Any]]:
+    secret = get_secret(key)
+    if not secret or not secret.get("sd_delay"):
+        return None
+
+    init_db()
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE secrets
+            SET sd_delay = NULL, inline_message_id = NULL, chat_id = NULL, message_id = NULL
+            WHERE key = ?
+            """,
+            (key,),
+        )
+        conn.commit()
+
+    return {
+        "delay": secret["sd_delay"],
+        "inline_message_id": secret.get("inline_message_id"),
+        "chat_id": secret.get("chat_id"),
+        "message_id": secret.get("message_id"),
+    }
