@@ -17,7 +17,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from cipher import decode, encode
 from config import BOT_TOKEN, SELF_DESTRUCT_DELAY
-from storage import get_text, store_text
+from storage import arm_self_destruct, get_text, pop_self_destruct_delay, store_text
 
 logging.basicConfig(level=logging.INFO)
 
@@ -94,7 +94,7 @@ async def start_cmd(message: Message):
         "Функции:\n"
         "• Шифрование текста в эмодзи\n"
         "• Расшифровка эмодзи обратно в текст\n"
-        "• Самоуничтожение сообщения\n"
+        "• Самоуничтожение после расшифровки\n"
         "• Inline-режим (сразу в эмодзи)\n\n"
         f"Пример в любом чате:\n"
         f"@{me.username} секретное сообщение\n\n"
@@ -220,6 +220,29 @@ async def decrypt_callback(callback: CallbackQuery):
         await callback.answer("Не удалось расшифровать сообщение.", show_alert=True)
         return
 
+    delay = pop_self_destruct_delay(key)
+    if delay:
+        if callback.message:
+            asyncio.create_task(
+                self_destruct(
+                    delay=delay,
+                    chat_id=callback.message.chat.id,
+                    message_id=callback.message.message_id,
+                )
+            )
+        elif callback.inline_message_id:
+            asyncio.create_task(
+                self_destruct(
+                    delay=delay,
+                    inline_message_id=callback.inline_message_id,
+                )
+            )
+        await callback.answer(
+            f"🔓 Расшифровано. Удаление через {delay} сек.",
+            show_alert=False,
+        )
+        return
+
     await callback.answer("🔓 Сообщение расшифровано")
 
 
@@ -228,32 +251,15 @@ async def selfdestruct_callback(callback: CallbackQuery):
     parts = callback.data.split(":")
     key = parts[1]
     delay = int(parts[2])
-    text = message_text_from_callback(callback) or get_text(key)
-    if not text:
-        await callback.answer("Текст не найден.", show_alert=True)
+
+    if not arm_self_destruct(key, delay):
+        await callback.answer("Текст не найден. Отправьте сообщение заново.", show_alert=True)
         return
 
-    if not await edit_secret_message(callback, text):
-        await callback.answer("Не удалось подготовить сообщение.", show_alert=True)
-        return
-
-    if callback.message:
-        asyncio.create_task(
-            self_destruct(
-                delay=delay,
-                chat_id=callback.message.chat.id,
-                message_id=callback.message.message_id,
-            )
-        )
-    elif callback.inline_message_id:
-        asyncio.create_task(
-            self_destruct(
-                delay=delay,
-                inline_message_id=callback.inline_message_id,
-            )
-        )
-
-    await callback.answer(f"💣 Удаление через {delay} сек")
+    await callback.answer(
+        f"💣 Удалится через {delay} сек после расшифровки",
+        show_alert=True,
+    )
 
 
 async def main():
