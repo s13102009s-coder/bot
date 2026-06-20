@@ -1,13 +1,13 @@
 import sqlite3
 import time
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from config import DB_PATH, TTL_SECONDS
 from pin_utils import hash_pin, verify_pin
 
 _pending_attempts: Dict[str, int] = {}
-_pending_decrypt: Dict[int, str] = {}
+_pin_buffers: Dict[Tuple[int, str], str] = {}
 
 
 def _connect() -> sqlite3.Connection:
@@ -84,15 +84,19 @@ def pin_attempts(key: str) -> int:
     return _pending_attempts.get(key, 0)
 
 
-def set_pending_decrypt(user_id: int, key: Optional[str]) -> None:
-    if key:
-        _pending_decrypt[user_id] = key
+def get_pin_buffer(user_id: int, key: str) -> str:
+    return _pin_buffers.get((user_id, key), "")
+
+
+def set_pin_buffer(user_id: int, key: str, value: str) -> None:
+    if value:
+        _pin_buffers[(user_id, key)] = value
     else:
-        _pending_decrypt.pop(user_id, None)
+        _pin_buffers.pop((user_id, key), None)
 
 
-def get_pending_decrypt(user_id: int) -> Optional[str]:
-    return _pending_decrypt.get(user_id)
+def clear_pin_buffer(user_id: int, key: str) -> None:
+    _pin_buffers.pop((user_id, key), None)
 
 
 def arm_self_destruct(

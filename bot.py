@@ -4,11 +4,8 @@ import uuid
 from typing import Optional
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery,
     InlineQuery,
@@ -24,12 +21,13 @@ from pin_utils import parse_pin_and_text
 from storage import (
     arm_self_destruct,
     check_pin,
+    clear_pin_buffer,
+    get_pin_buffer,
     get_secret,
     init_db,
     pin_attempts,
     pop_self_destruct_target,
-    set_pending_decrypt,
-    get_pending_decrypt,
+    set_pin_buffer,
     store_secret,
 )
 
@@ -41,15 +39,17 @@ except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
+dp = Dispatcher()
 
-
-class DecryptFlow(StatesGroup):
-    waiting_pin = State()
+ALERT_TEXT_LIMIT = 190
 
 
 def secret_keyboard(text: str, pin: str):
     key = store_secret(text, pin)
+    return secret_keyboard_for_key(key)
+
+
+def secret_keyboard_for_key(key: str):
     builder = InlineKeyboardBuilder()
     builder.button(text="🔓 Расшифровать", callback_data=f"dec:{key}")
     builder.button(
@@ -60,11 +60,43 @@ def secret_keyboard(text: str, pin: str):
     return builder.as_markup()
 
 
+def pin_pad_keyboard(key: str, entered: str):
+    dots = "•" * len(entered) if entered else "—"
+    builder = InlineKeyboardBuilder()
+    builder.button(text=f"PIN: {dots}", callback_data=f"pn:{key}")
+    for row in ((1, 2, 3), (4, 5, 6), (7, 8, 9)):
+        for digit in row:
+            builder.button(text=str(digit), callback_data=f"pd:{key}:{digit}")
+    builder.button(text="⌫", callback_data=f"pb:{key}")
+    builder.button(text="0", callback_data=f"pd:{key}:0")
+    builder.button(text="✓", callback_data=f"pc:{key}")
+    builder.button(text="✖ Отмена", callback_data=f"px:{key}")
+    builder.adjust(1, 3, 3, 3, 3, 1)
+    return builder.as_markup()
+
+
 def pin_format_hint() -> str:
     return (
-        f"Укажите PIN в начале ( {PIN_MIN}–{PIN_MAX} цифр ), затем текст.\n"
+        f"Укажите PIN в начале ({PIN_MIN}–{PIN_MAX} цифр), затем текст.\n"
         "Пример: 1234 привет"
     )
+
+
+async def edit_secret_markup(callback: CallbackQuery, reply_markup) -> bool:
+    try:
+        if callback.message:
+            await callback.message.edit_reply_markup(reply_markup=reply_markup)
+        elif callback.inline_message_id:
+            await bot.edit_message_reply_markup(
+                inline_message_id=callback.inline_message_id,
+                reply_markup=reply_markup,
+            )
+        else:
+            return False
+        return True
+    except TelegramBadRequest as exc:
+        logging.warning("Не удалось обновить клавиатуру: %s", exc)
+        return False
 
 
 async def self_destruct(
@@ -101,46 +133,28 @@ async def schedule_self_destruct(key: str):
     )
 
 
-async def begin_pin_decrypt(user_id: int, key: str, state: FSMContext) -> bool:
-    if not get_secret(key):
-        return False
-    await state.set_state(DecryptFlow.waiting_pin)
-    await state.update_data(decrypt_key=key)
-    set_pending_decrypt(user_id, key)
-    await bot.send_message(
-        user_id,
-        "🔓 Введите PIN для расшифровки.\n"
-        "Текст будет показан только вам в этом чате.\n"
-        "В группе сообщение останется зашифрованным.",
-    )
-    return True
+def format_decrypt_alert(plaintext: str) -> str:
+    text = plaintext.upper()
+    body = f"🔓 {text}"
+    if len(body) > ALERT_TEXT_LIMIT:
+        return body[: ALERT_TEXT_LIMIT - 1] + "…"
+    return body
 
 
 @dp.message(CommandStart())
-async def start_cmd(message: Message, command: CommandObject, state: FSMContext):
+async def start_cmd(message: Message):
     me = await bot.get_me()
-    args = (command.args or "").strip()
-
-    if args.startswith("dec_"):
-        key = args[4:]
-        if await begin_pin_decrypt(message.from_user.id, key, state):
-            return
-        await message.answer("Сообщение не найдено или срок хранения истёк.")
-        return
-
     await message.answer(
         "🔐 Secret Cipher Bot\n\n"
-        "Как отправить зашифрованное сообщение:\n"
+        "Как отправить:\n"
         f"1. В любом чате: @{me.username} 1234 ваш текст\n"
-        f"   (PIN — {PIN_MIN}–{PIN_MAX} цифр, затем пробел, затем текст)\n"
-        "2. Выберите «🔐 Отправить зашифрованным»\n"
-        "3. В чат уходят эмодзи\n\n"
-        "Как прочитать:\n"
+        "2. Выберите «🔐 Отправить зашифрованным»\n\n"
+        "Как прочитать (без перехода в личку):\n"
         "1. Нажмите «🔓 Расшифровать»\n"
-        "2. Бот попросит PIN в личке\n"
-        "3. После верного PIN текст придёт только вам\n\n"
-        f"Опционально: «💣 Удалить…» — исчезнет через {SELF_DESTRUCT_DELAY} сек "
-        "после успешной расшифровки.\n\n"
+        "2. Наберите PIN кнопками под сообщением\n"
+        "3. Нажмите ✓ — текст откроется только вам во всплывающем окне\n"
+        "   PIN не появится в чате как сообщение\n\n"
+        f"«💣 Удалить…» — исчезнет через {SELF_DESTRUCT_DELAY} сек после расшифровки.\n\n"
         f"В личке с ботом: {pin_format_hint()}\n"
         "/decode эмодзи — расшифровать вручную без PIN"
     )
@@ -164,74 +178,14 @@ async def decode_cmd(message: Message):
     await message.answer(f"🔓 <code>{decoded}</code>", parse_mode="HTML")
 
 
-async def process_pin_entry(message: Message, state: FSMContext, key: str) -> bool:
-    """Проверяет PIN и отправляет расшифрованный текст. True — обработано."""
-    if not key or not get_secret(key):
-        await state.clear()
-        await message.answer("Сообщение не найдено или срок хранения истёк.")
-        return True
-
-    pin = (message.text or "").strip()
-    if not pin.isdigit():
-        await message.answer("PIN должен состоять только из цифр.")
-        return True
-
-    plaintext = check_pin(key, pin)
-    if plaintext is None:
-        if pin_attempts(key) >= MAX_PIN_ATTEMPTS:
-            await state.clear()
-            await message.answer(
-                "Слишком много неверных попыток. Нажмите «Расшифровать» в сообщении снова."
-            )
-            return True
-        left = MAX_PIN_ATTEMPTS - pin_attempts(key)
-        await message.answer(f"Неверный PIN. Осталось попыток: {left}")
-        return True
-
-    await state.clear()
-    set_pending_decrypt(message.from_user.id, None)
-    await message.answer(
-        f"🔓 Сообщение:\n\n<code>{plaintext.upper()}</code>",
-        parse_mode="HTML",
-    )
-    await schedule_self_destruct(key)
-    return True
-
-
-@dp.message(DecryptFlow.waiting_pin, F.text)
-async def receive_pin(message: Message, state: FSMContext):
-    data = await state.get_data()
-    key = data.get("decrypt_key")
-    await process_pin_entry(message, state, key)
-
-
-@dp.message(
-    F.chat.type == "private",
-    F.text.regexp(rf"^\d{{{PIN_MIN},{PIN_MAX}}}$"),
-    ~StateFilter(DecryptFlow.waiting_pin),
-)
-async def receive_pin_fallback(message: Message, state: FSMContext):
-    key = get_pending_decrypt(message.from_user.id)
-    if not key:
-        return
-    await state.set_state(DecryptFlow.waiting_pin)
-    await state.update_data(decrypt_key=key)
-    await process_pin_entry(message, state, key)
-
-
-@dp.message(
-    F.text & ~F.text.startswith("/"),
-    ~StateFilter(DecryptFlow.waiting_pin),
-)
+@dp.message(F.text & ~F.text.startswith("/"))
 async def auto_encrypt_message(message: Message):
     if message.chat.type != "private":
         return
 
     pin, text = parse_pin_and_text(message.text or "")
     if not pin:
-        await message.answer(
-            "🔐 Чтобы зашифровать сообщение:\n\n" + pin_format_hint()
-        )
+        await message.answer("🔐 Чтобы зашифровать сообщение:\n\n" + pin_format_hint())
         return
 
     encrypted = encode(text)
@@ -260,7 +214,7 @@ async def inline_handler(inline_query: InlineQuery):
                     title=f"⚠️ Сначала PIN ({PIN_MIN}–{PIN_MAX} цифр)",
                     description="Пример: 1234 привет",
                     input_message_content=InputTextMessageContent(
-                        message_text=f"⚠️ Формат: PIN пробел текст. Пример: 1234 привет"
+                        message_text="⚠️ Формат: PIN пробел текст. Пример: 1234 привет"
                     ),
                 )
             ],
@@ -285,27 +239,97 @@ async def inline_handler(inline_query: InlineQuery):
 
 
 @dp.callback_query(F.data.startswith("dec:"))
-async def decrypt_callback(callback: CallbackQuery, state: FSMContext):
+async def decrypt_callback(callback: CallbackQuery):
     key = callback.data.split(":", 1)[1]
     if not get_secret(key):
         await callback.answer("Сообщение не найдено или срок хранения истёк.", show_alert=True)
         return
 
-    me = await bot.get_me()
     user_id = callback.from_user.id
+    set_pin_buffer(user_id, key, "")
+    if await edit_secret_markup(callback, pin_pad_keyboard(key, "")):
+        await callback.answer("Наберите PIN кнопками. Его не увидят другие.")
+    else:
+        await callback.answer("Не удалось открыть ввод PIN.", show_alert=True)
 
-    try:
-        ok = await begin_pin_decrypt(user_id, key, state)
-        if ok:
-            await callback.answer("Введите PIN в личке с ботом")
-        else:
-            await callback.answer("Сообщение не найдено.", show_alert=True)
-    except TelegramForbiddenError:
-        await callback.answer(
-            "Сначала откройте бота и нажмите Start",
-            show_alert=True,
-            url=f"https://t.me/{me.username}?start=dec_{key}",
-        )
+
+@dp.callback_query(F.data.startswith("pn:"))
+async def pin_display_callback(callback: CallbackQuery):
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("pd:"))
+async def pin_digit_callback(callback: CallbackQuery):
+    _, key, digit = callback.data.split(":", 2)
+    user_id = callback.from_user.id
+    entered = get_pin_buffer(user_id, key)
+    if len(entered) >= PIN_MAX:
+        await callback.answer("Максимальная длина PIN")
+        return
+    entered += digit
+    set_pin_buffer(user_id, key, entered)
+    if await edit_secret_markup(callback, pin_pad_keyboard(key, entered)):
+        await callback.answer()
+    else:
+        await callback.answer("Ошибка обновления клавиатуры", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("pb:"))
+async def pin_backspace_callback(callback: CallbackQuery):
+    key = callback.data.split(":", 1)[1]
+    user_id = callback.from_user.id
+    entered = get_pin_buffer(user_id, key)
+    set_pin_buffer(user_id, key, entered[:-1])
+    if await edit_secret_markup(callback, pin_pad_keyboard(key, entered[:-1])):
+        await callback.answer()
+    else:
+        await callback.answer("Ошибка", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("px:"))
+async def pin_cancel_callback(callback: CallbackQuery):
+    key = callback.data.split(":", 1)[1]
+    clear_pin_buffer(callback.from_user.id, key)
+    if await edit_secret_markup(callback, secret_keyboard_for_key(key)):
+        await callback.answer("Ввод PIN отменён")
+    else:
+        await callback.answer("Отменено")
+
+
+@dp.callback_query(F.data.startswith("pc:"))
+async def pin_confirm_callback(callback: CallbackQuery):
+    key = callback.data.split(":", 1)[1]
+    user_id = callback.from_user.id
+    entered = get_pin_buffer(user_id, key)
+
+    if len(entered) < PIN_MIN:
+        await callback.answer(f"PIN должен быть {PIN_MIN}–{PIN_MAX} цифр", show_alert=True)
+        return
+
+    if not get_secret(key):
+        await callback.answer("Сообщение не найдено или срок хранения истёк.", show_alert=True)
+        return
+
+    plaintext = check_pin(key, entered)
+    if plaintext is None:
+        if pin_attempts(key) >= MAX_PIN_ATTEMPTS:
+            clear_pin_buffer(user_id, key)
+            await edit_secret_markup(callback, secret_keyboard_for_key(key))
+            await callback.answer(
+                "Слишком много неверных попыток. Нажмите «Расшифровать» снова.",
+                show_alert=True,
+            )
+            return
+        left = MAX_PIN_ATTEMPTS - pin_attempts(key)
+        set_pin_buffer(user_id, key, "")
+        await edit_secret_markup(callback, pin_pad_keyboard(key, ""))
+        await callback.answer(f"Неверный PIN. Осталось попыток: {left}", show_alert=True)
+        return
+
+    clear_pin_buffer(user_id, key)
+    await edit_secret_markup(callback, secret_keyboard_for_key(key))
+    await callback.answer(format_decrypt_alert(plaintext), show_alert=True)
+    await schedule_self_destruct(key)
 
 
 @dp.callback_query(F.data.startswith("sd:"))
