@@ -91,14 +91,13 @@ async def start_cmd(message: Message):
     await message.answer(
         "🔐 Secret Cipher Bot\n\n"
         "Как это работает:\n"
-        f"1. В любом чате: @{me.username} ваш текст\n"
-        "2. В чат уходит уже зашифрованное сообщение (эмодзи)\n"
-        "3. Получатель нажимает «🔓 Расшифровать»\n"
-        f"4. Опционально отправитель включает «💣 Удалить…» — "
-        f"тогда после расшифровки сообщение исчезнет через {SELF_DESTRUCT_DELAY} сек\n\n"
-        "В личке с ботом:\n"
-        "/encrypt текст — зашифровать\n"
-        "/decode текст — расшифровать"
+        f"1. В любом чате в строке сообщения: @{me.username} пробел ваш текст\n"
+        "2. Нажмите на подсказку «🔐 Отправить зашифрованным» (или Enter)\n"
+        "3. В чат уходит уже зашифрованное сообщение (эмодзи)\n"
+        "4. Получатель нажимает «🔓 Расшифровать»\n"
+        f"5. Опционально «💣 Удалить…» — исчезнет через {SELF_DESTRUCT_DELAY} сек после расшифровки\n\n"
+        "В личке с ботом — просто напишите текст, бот зашифрует автоматически.\n"
+        "/decode текст — расшифровать вручную"
     )
 
 
@@ -138,32 +137,45 @@ async def decode_cmd(message: Message):
     await message.answer(f"🔓 <code>{decoded}</code>", parse_mode="HTML")
 
 
+@dp.message(F.text & ~F.text.startswith("/"))
+async def auto_encrypt_message(message: Message):
+    """Личка с ботом: любой текст сразу уходит зашифрованным."""
+    if message.chat.type != "private":
+        return
+
+    me = await bot.get_me()
+    text = (message.text or "").strip()
+    mention = f"@{me.username}"
+    if text.lower().startswith(mention.lower()):
+        text = text[len(mention) :].strip()
+
+    if not text:
+        return
+
+    encrypted = encode(text)
+    await message.answer(encrypted, reply_markup=secret_keyboard(text))
+
+
 @dp.inline_query()
 async def inline_handler(inline_query: InlineQuery):
     query = inline_query.query.strip()
     if not query:
         await inline_query.answer(
-            results=[
-                InlineQueryResultArticle(
-                    id="hint",
-                    title="Введите текст сообщения",
-                    description="Например: привет мир",
-                    input_message_content=InputTextMessageContent(
-                        message_text="Введите текст после @бота"
-                    ),
-                )
-            ],
+            results=[],
             cache_time=1,
             is_personal=True,
+            switch_pm_text="Как отправить зашифрованное сообщение",
+            switch_pm_parameter="start",
         )
         return
 
     encrypted = encode(query)
+    preview = encrypted if len(encrypted) <= 48 else f"{encrypted[:48]}…"
     results = [
         InlineQueryResultArticle(
             id=str(uuid.uuid4()),
-            title="Секретное сообщение",
-            description=encrypted[:64],
+            title="🔐 Отправить зашифрованным",
+            description=preview,
             input_message_content=InputTextMessageContent(message_text=encrypted),
             reply_markup=secret_keyboard(query),
         )
