@@ -33,10 +33,9 @@ dp = Dispatcher()
 def secret_keyboard(text: str):
     key = store_text(text)
     builder = InlineKeyboardBuilder()
-    builder.button(text="🔐 Зашифровать", callback_data=f"enc:{key}")
     builder.button(text="🔓 Расшифровать", callback_data=f"dec:{key}")
     builder.button(
-        text=f"💣 Удалить через {SELF_DESTRUCT_DELAY} сек",
+        text=f"💣 Удалить через {SELF_DESTRUCT_DELAY} сек после расшифровки",
         callback_data=f"sd:{key}:{SELF_DESTRUCT_DELAY}",
     )
     builder.adjust(1)
@@ -91,15 +90,15 @@ async def start_cmd(message: Message):
     me = await bot.get_me()
     await message.answer(
         "🔐 Secret Cipher Bot\n\n"
-        "Функции:\n"
-        "• Шифрование текста в эмодзи\n"
-        "• Расшифровка эмодзи обратно в текст\n"
-        "• Самоуничтожение после расшифровки\n"
-        "• Inline-режим (сразу в эмодзи)\n\n"
-        f"Пример в любом чате:\n"
-        f"@{me.username} секретное сообщение\n\n"
+        "Как это работает:\n"
+        f"1. В любом чате: @{me.username} ваш текст\n"
+        "2. В чат уходит уже зашифрованное сообщение (эмодзи)\n"
+        "3. Получатель нажимает «🔓 Расшифровать»\n"
+        f"4. Опционально отправитель включает «💣 Удалить…» — "
+        f"тогда после расшифровки сообщение исчезнет через {SELF_DESTRUCT_DELAY} сек\n\n"
+        "В личке с ботом:\n"
         "/encrypt текст — зашифровать\n"
-        "/decode — расшифровать ответ или текст после команды."
+        "/decode текст — расшифровать"
     )
 
 
