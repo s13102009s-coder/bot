@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import uuid
+from typing import Optional
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest
@@ -42,10 +43,45 @@ def secret_keyboard(text: str):
     return builder.as_markup()
 
 
-async def self_destruct(chat_id: int, message_id: int, delay: int):
+async def edit_secret_message(
+    callback: CallbackQuery,
+    text: str,
+    reply_markup=None,
+) -> bool:
+    """Редактирование обычного и inline-сообщения (через inline_message_id)."""
+    try:
+        if callback.message:
+            await callback.message.edit_text(text, reply_markup=reply_markup)
+        elif callback.inline_message_id:
+            await bot.edit_message_text(
+                text=text,
+                inline_message_id=callback.inline_message_id,
+                reply_markup=reply_markup,
+            )
+        else:
+            return False
+        return True
+    except TelegramBadRequest as exc:
+        logging.warning("Не удалось изменить сообщение: %s", exc)
+        return False
+
+
+async def self_destruct(
+    *,
+    delay: int,
+    chat_id: Optional[int] = None,
+    message_id: Optional[int] = None,
+    inline_message_id: Optional[str] = None,
+):
     await asyncio.sleep(delay)
     try:
-        await bot.delete_message(chat_id, message_id)
+        if chat_id is not None and message_id is not None:
+            await bot.delete_message(chat_id, message_id)
+        elif inline_message_id:
+            await bot.edit_message_text(
+                text="💣 Сообщение удалено",
+                inline_message_id=inline_message_id,
+            )
     except TelegramBadRequest:
         pass
 
@@ -59,11 +95,30 @@ async def start_cmd(message: Message):
         "• Шифрование текста в эмодзи\n"
         "• Расшифровка эмодзи обратно в текст\n"
         "• Самоуничтожение сообщения\n"
-        "• Inline-режим\n\n"
+        "• Inline-режим (сразу в эмодзи)\n\n"
         f"Пример в любом чате:\n"
         f"@{me.username} секретное сообщение\n\n"
-        "Команда /decode — расшифровать текст или ответ на сообщение."
+        "/encrypt текст — зашифровать\n"
+        "/decode — расшифровать ответ или текст после команды."
     )
+
+
+@dp.message(Command("encrypt", "encode"))
+async def encrypt_cmd(message: Message):
+    text = ""
+    if message.reply_to_message and message.reply_to_message.text:
+        text = message.reply_to_message.text
+    elif message.text:
+        parts = message.text.split(maxsplit=1)
+        if len(parts) > 1:
+            text = parts[1]
+
+    if not text:
+        await message.answer("Используйте /encrypt текст или ответ на сообщение.")
+        return
+
+    encrypted = encode(text)
+    await message.answer(encrypted)
 
 
 @dp.message(Command("decode"))
@@ -104,12 +159,13 @@ async def inline_handler(inline_query: InlineQuery):
         )
         return
 
+    encrypted = encode(query)
     results = [
         InlineQueryResultArticle(
             id=str(uuid.uuid4()),
             title="Секретное сообщение",
-            description=query[:64],
-            input_message_content=InputTextMessageContent(message_text=query),
+            description=encrypted[:64],
+            input_message_content=InputTextMessageContent(message_text=encrypted),
             reply_markup=secret_keyboard(query),
         )
     ]
@@ -126,10 +182,9 @@ async def encrypt_callback(callback: CallbackQuery):
         return
 
     encrypted = encode(text)
-    try:
-        await callback.message.edit_text(encrypted)
-    except TelegramBadRequest:
-        pass
+    if not await edit_secret_message(callback, encrypted):
+        await callback.answer("Не удалось зашифровать сообщение.", show_alert=True)
+        return
 
     await callback.answer("🔐 Сообщение зашифровано")
 
@@ -142,10 +197,9 @@ async def decrypt_callback(callback: CallbackQuery):
         return
 
     decrypted = decode(text)
-    try:
-        await callback.message.edit_text(f"🔓 {decrypted}")
-    except TelegramBadRequest:
-        pass
+    if not await edit_secret_message(callback, f"🔓 {decrypted}"):
+        await callback.answer("Не удалось расшифровать сообщение.", show_alert=True)
+        return
 
     await callback.answer("🔓 Сообщение расшифровано")
 
@@ -160,18 +214,25 @@ async def selfdestruct_callback(callback: CallbackQuery):
         await callback.answer("Текст не найден.", show_alert=True)
         return
 
-    try:
-        await callback.message.edit_text(text)
-    except TelegramBadRequest:
-        pass
+    if not await edit_secret_message(callback, text):
+        await callback.answer("Не удалось подготовить сообщение.", show_alert=True)
+        return
 
-    asyncio.create_task(
-        self_destruct(
-            callback.message.chat.id,
-            callback.message.message_id,
-            delay,
+    if callback.message:
+        asyncio.create_task(
+            self_destruct(
+                delay=delay,
+                chat_id=callback.message.chat.id,
+                message_id=callback.message.message_id,
+            )
         )
-    )
+    elif callback.inline_message_id:
+        asyncio.create_task(
+            self_destruct(
+                delay=delay,
+                inline_message_id=callback.inline_message_id,
+            )
+        )
 
     await callback.answer(f"💣 Удаление через {delay} сек")
 
