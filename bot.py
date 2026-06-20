@@ -5,7 +5,7 @@ from typing import Optional
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -28,6 +28,8 @@ from storage import (
     init_db,
     pin_attempts,
     pop_self_destruct_target,
+    set_pending_decrypt,
+    get_pending_decrypt,
     store_secret,
 )
 
@@ -104,6 +106,7 @@ async def begin_pin_decrypt(user_id: int, key: str, state: FSMContext) -> bool:
         return False
     await state.set_state(DecryptFlow.waiting_pin)
     await state.update_data(decrypt_key=key)
+    set_pending_decrypt(user_id, key)
     await bot.send_message(
         user_id,
         "🔓 Введите PIN для расшифровки.\n"
@@ -161,12 +164,66 @@ async def decode_cmd(message: Message):
     await message.answer(f"🔓 <code>{decoded}</code>", parse_mode="HTML")
 
 
-@dp.message(F.text & ~F.text.startswith("/"))
-async def auto_encrypt_message(message: Message, state: FSMContext):
-    current = await state.get_state()
-    if current == DecryptFlow.waiting_pin.state:
-        return
+async def process_pin_entry(message: Message, state: FSMContext, key: str) -> bool:
+    """Проверяет PIN и отправляет расшифрованный текст. True — обработано."""
+    if not key or not get_secret(key):
+        await state.clear()
+        await message.answer("Сообщение не найдено или срок хранения истёк.")
+        return True
 
+    pin = (message.text or "").strip()
+    if not pin.isdigit():
+        await message.answer("PIN должен состоять только из цифр.")
+        return True
+
+    plaintext = check_pin(key, pin)
+    if plaintext is None:
+        if pin_attempts(key) >= MAX_PIN_ATTEMPTS:
+            await state.clear()
+            await message.answer(
+                "Слишком много неверных попыток. Нажмите «Расшифровать» в сообщении снова."
+            )
+            return True
+        left = MAX_PIN_ATTEMPTS - pin_attempts(key)
+        await message.answer(f"Неверный PIN. Осталось попыток: {left}")
+        return True
+
+    await state.clear()
+    set_pending_decrypt(message.from_user.id, None)
+    await message.answer(
+        f"🔓 Сообщение:\n\n<code>{plaintext.upper()}</code>",
+        parse_mode="HTML",
+    )
+    await schedule_self_destruct(key)
+    return True
+
+
+@dp.message(DecryptFlow.waiting_pin, F.text)
+async def receive_pin(message: Message, state: FSMContext):
+    data = await state.get_data()
+    key = data.get("decrypt_key")
+    await process_pin_entry(message, state, key)
+
+
+@dp.message(
+    F.chat.type == "private",
+    F.text.regexp(rf"^\d{{{PIN_MIN},{PIN_MAX}}}$"),
+    ~StateFilter(DecryptFlow.waiting_pin),
+)
+async def receive_pin_fallback(message: Message, state: FSMContext):
+    key = get_pending_decrypt(message.from_user.id)
+    if not key:
+        return
+    await state.set_state(DecryptFlow.waiting_pin)
+    await state.update_data(decrypt_key=key)
+    await process_pin_entry(message, state, key)
+
+
+@dp.message(
+    F.text & ~F.text.startswith("/"),
+    ~StateFilter(DecryptFlow.waiting_pin),
+)
+async def auto_encrypt_message(message: Message):
     if message.chat.type != "private":
         return
 
@@ -179,40 +236,6 @@ async def auto_encrypt_message(message: Message, state: FSMContext):
 
     encrypted = encode(text)
     await message.answer(encrypted, reply_markup=secret_keyboard(text, pin))
-
-
-@dp.message(DecryptFlow.waiting_pin, F.text)
-async def receive_pin(message: Message, state: FSMContext):
-    data = await state.get_data()
-    key = data.get("decrypt_key")
-    if not key or not get_secret(key):
-        await state.clear()
-        await message.answer("Сообщение не найдено или срок хранения истёк.")
-        return
-
-    pin = (message.text or "").strip()
-    if not pin.isdigit():
-        await message.answer("PIN должен состоять только из цифр.")
-        return
-
-    plaintext = check_pin(key, pin)
-    if plaintext is None:
-        if pin_attempts(key) >= MAX_PIN_ATTEMPTS:
-            await state.clear()
-            await message.answer(
-                "Слишком много неверных попыток. Нажмите «Расшифровать» в сообщении снова."
-            )
-            return
-        left = MAX_PIN_ATTEMPTS - pin_attempts(key)
-        await message.answer(f"Неверный PIN. Осталось попыток: {left}")
-        return
-
-    await state.clear()
-    await message.answer(
-        f"🔓 Сообщение:\n\n<code>{plaintext.upper()}</code>",
-        parse_mode="HTML",
-    )
-    await schedule_self_destruct(key)
 
 
 @dp.inline_query()

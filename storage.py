@@ -7,6 +7,7 @@ from config import DB_PATH, TTL_SECONDS
 from pin_utils import hash_pin, verify_pin
 
 _pending_attempts: Dict[str, int] = {}
+_pending_decrypt: Dict[int, str] = {}
 
 
 def _connect() -> sqlite3.Connection:
@@ -81,6 +82,17 @@ def check_pin(key: str, pin: str) -> Optional[str]:
 
 def pin_attempts(key: str) -> int:
     return _pending_attempts.get(key, 0)
+
+
+def set_pending_decrypt(user_id: int, key: Optional[str]) -> None:
+    if key:
+        _pending_decrypt[user_id] = key
+    else:
+        _pending_decrypt.pop(user_id, None)
+
+
+def get_pending_decrypt(user_id: int) -> Optional[str]:
+    return _pending_decrypt.get(user_id)
 
 
 def arm_self_destruct(
